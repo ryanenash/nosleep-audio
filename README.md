@@ -9,6 +9,7 @@ Turns r/nosleep posts into narrated audiobooks for personal listening.
 
 ```sh
 python nosleep.py build <reddit post url> [--voice bm_george]
+python nosleep.py build <part 1 url> <part 2 url> ... --series NAME   # one file, a chapter per part
 python nosleep.py publish
 ```
 

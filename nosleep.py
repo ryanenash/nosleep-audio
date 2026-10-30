@@ -2,6 +2,8 @@
 """Turn an r/nosleep post into a narrated .m4b (iPod) and .m4a (podcast feed).
 
 Usage: nosleep.py build <post url> [--voice bm_george]
+       nosleep.py build <part 1 url> <part 2 url> ... --series NAME [--voice bm_george]
+       nosleep.py publish
 """
 import argparse
 import html
@@ -13,6 +15,7 @@ import textwrap
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -60,12 +63,15 @@ class Blocks(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.blocks, self.buf, self.depth, self.done = [], [], 0, False
+        self.linked, self.haslink = set(), False  # indices of blocks that link to another reddit post
 
     def flush(self):
         t = " ".join("".join(self.buf).split())
         if t:
+            if self.haslink:
+                self.linked.add(len(self.blocks))
             self.blocks.append(t)
-        self.buf = []
+        self.buf, self.haslink = [], False
 
     def handle_starttag(self, tag, attrs):
         if self.done:
@@ -76,6 +82,8 @@ class Blocks(HTMLParser):
             self.depth += 1
         elif self.depth and tag in ("p", "li", "h1", "h2", "h3", "blockquote", "br"):
             self.flush()
+        elif self.depth and tag == "a" and "/comments/" in (dict(attrs).get("href") or ""):
+            self.haslink = True
         elif self.depth and tag == "hr":
             self.flush()
             self.blocks.append(None)
@@ -102,7 +110,7 @@ def clean(t):
     t = re.sub(r"https?://\S+|www\.\S+", "", t)
     t = re.sub(r"[*_~#>`]+", "", t)  # stray markdown
     t = re.sub(r"\[([^\]]*)\]", r"\1", t)  # "[Redacted]" -> "Redacted"
-    return " ".join(t.split())
+    return " ".join(t.split()) if re.search(r"\w", t) else ""  # drop "---" style separators
 
 
 def spoken_name(author):
@@ -110,19 +118,37 @@ def spoken_name(author):
     return re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Za-z])(?=\d)|_", " ", author)
 
 
-def script(post):
-    """Return chapters as [(name, [paragraph, ...])]: title line, body by section/length, edits last."""
+def parse(post):
+    """Body blocks (None = horizontal rule) and author edits, cleaned."""
     p = Blocks()
     p.feed(post["html"])
     body, edits = [], []
-    for b in p.blocks:
+    for i, b in enumerate(p.blocks):
         if b is None:
             body.append(None)
             continue
         b = clean(b)
-        if not b or AWARD_RE.search(b):
+        # Short linked lines ("Part 2 here", "Update") just join series posts; a story's last line can be a link too.
+        if not b or AWARD_RE.search(b) or (i in p.linked and len(b.split()) <= 6):
             continue
         (edits if EDIT_RE.match(b) else body).append(b)
+    return body, edits
+
+
+def series_script(posts, name):
+    """One chapter per part; each part's edits stay at the end of its own chapter."""
+    chapters = []
+    for i, post in enumerate(posts):
+        body, edits = parse(post)
+        paras = [f"Part {i + 1}."] + [b for b in body if b] + edits
+        chapters.append((f"Part {i + 1}", paras))
+    chapters[0][1].insert(0, f"{name}, by u slash {spoken_name(posts[0]['author'])}.")
+    return chapters
+
+
+def script(post):
+    """Return chapters as [(name, [paragraph, ...])]: title line, body by section/length, edits last."""
+    body, edits = parse(post)
 
     # Split on horizontal rules if the author used them; otherwise every ~CHAPTER_WORDS words.
     sections, cur = [], []
@@ -198,7 +224,11 @@ def cover(post, path):
     by.unlink()
 
 
-def encode(post, chapters, starts, duration, wav, art, dest, series=None):
+def voice_name(voice):
+    return voice.split("_")[1].title()  # bm_george -> George
+
+
+def encode(post, chapters, starts, duration, wav, art, dest, voice):
     meta = [";FFMETADATA1"]
     ends = starts[1:] + [duration]
     for (name, _), s, e in zip(chapters, starts, ends):
@@ -209,15 +239,13 @@ def encode(post, chapters, starts, duration, wav, art, dest, series=None):
         "title": post["title"],
         "artist": f"u/{post['author']}",
         "album_artist": f"u/{post['author']}",
-        "album": series["name"] if series else post["title"],
+        "album": post["title"],
+        "composer": f"Read by {voice_name(voice)} ({voice})",  # the usual narrator slot; Books/Finder show it
         "genre": "Horror",
         "date": post["published"][:10],
-        "comment": post["url"],
+        "comment": f"Read by {voice_name(voice)} ({voice}). {post['url']}",
         "media_type": "2",  # stik=Audiobook, so iTunes/Books files it under Audiobooks
     }
-    if series:
-        tags["track"] = str(series["part"])
-        tags["show"] = series["name"]
     m4b = dest.with_suffix(".m4b")
     cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(wav), "-i", str(mfile), "-i", str(art),
            "-map", "0:a", "-map", "2:v", "-map_metadata", "1", "-map_chapters", "1",
@@ -234,10 +262,21 @@ def encode(post, chapters, starts, duration, wav, art, dest, series=None):
 
 
 def build(args):
-    post = fetch_post(args.url)
+    if len(args.urls) > 1 and not args.series:
+        sys.exit("several urls make a series: pass --series NAME")
+    posts = []
+    for u in args.urls:
+        posts.append(fetch_post(u))
+    if args.series:
+        # One file for the whole series; dated by its latest part so it surfaces in the feed.
+        post = {"id": f"s-{posts[0]['id']}", "title": args.series, "author": posts[0]["author"],
+                "url": posts[0]["url"], "published": posts[-1]["published"], "parts": [p["id"] for p in posts]}
+        chapters = series_script(posts, args.series)
+    else:
+        post = posts[0]
+        chapters = script(post)
     d = OUT / post["id"]
     d.mkdir(parents=True, exist_ok=True)
-    chapters = script(post)
     words = sum(len(p.split()) for _, ps in chapters for p in ps)
     print(f"{post['title']} by u/{post['author']}: {words} words, {len(chapters)} chapters", flush=True)
     wav = d / "narration.wav"
@@ -245,10 +284,12 @@ def build(args):
     starts, duration = narrate(chapters, args.voice, wav)
     print(f"narrated {duration / 60:.1f} min in {(time.time() - t0) / 60:.1f} min", flush=True)
     cover(post, d / "cover.jpg")
-    encode(post, chapters, starts, duration, wav, d / "cover.jpg", d / "story")
+    encode(post, chapters, starts, duration, wav, d / "cover.jpg", d / "story", args.voice)
     wav.unlink()
     (d / "meta.json").write_text(json.dumps({
         **{k: v for k, v in post.items() if k != "html"}, "voice": args.voice, "duration": duration,
+        # Feed date: when it joined the feed, so old stories don't sink below "older episodes".
+        "added": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "chapters": [{"title": n, "start": s} for (n, _), s in zip(chapters, starts)],
     }, indent=2))
     print(d)
@@ -272,7 +313,6 @@ def put(cfg, src, key, ctype):
 
 def feed_xml(base, items):
     from email.utils import format_datetime
-    from datetime import datetime
     from xml.sax.saxutils import escape as x
 
     out = ['<?xml version="1.0" encoding="UTF-8"?>',
@@ -284,10 +324,10 @@ def feed_xml(base, items):
     for m in items:
         dur = int(m["duration"])
         out += ["<item>", f"<title>{x(m['title'])}</title>",
-                f"<description>{x('by u/' + m['author'] + ' — ' + m['url'])}</description>",
+                f"<description>{x('Read by ' + voice_name(m['voice']) + '. By u/' + m['author'] + ' — ' + m['url'])}</description>",
                 f'<enclosure url="{base}/{m["id"]}.m4a" length="{m["m4a_bytes"]}" type="audio/x-m4a"/>',
                 f'<guid isPermaLink="false">nosleep-{m["id"]}</guid>',
-                f"<pubDate>{format_datetime(datetime.fromisoformat(m['published']))}</pubDate>",
+                f"<pubDate>{format_datetime(datetime.fromisoformat(m['added']))}</pubDate>",
                 f"<itunes:duration>{dur // 3600}:{dur // 60 % 60:02d}:{dur % 60:02d}</itunes:duration>",
                 f'<itunes:image href="{base}/{m["id"]}.jpg"/>', "</item>"]
     return "\n".join(out + ["</channel>", "</rss>"]) + "\n"
@@ -306,7 +346,7 @@ def publish(args):
             m["uploaded"] = True
             meta.write_text(json.dumps(m, indent=2))
         items.append(m)
-    items.sort(key=lambda m: m["published"], reverse=True)
+    items.sort(key=lambda m: m["added"], reverse=True)
     show = OUT / "show.jpg"
     if not show.exists():
         cover({"title": "NoSleep Reader", "author": "private"}, show)
@@ -321,7 +361,8 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(required=True)
     b = sub.add_parser("build")
-    b.add_argument("url")
+    b.add_argument("urls", nargs="+", metavar="url", help="one post, or every part of a series in order")
+    b.add_argument("--series", metavar="NAME", help="combine the urls into one file, a chapter per part")
     b.add_argument("--voice", default="bm_george")
     b.set_defaults(fn=build)
     sub.add_parser("publish").set_defaults(fn=publish)

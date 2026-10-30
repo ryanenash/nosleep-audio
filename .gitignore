@@ -1,0 +1,7 @@
+.venv/
+out/
+*.wav
+.claude/
+__pycache__/
+CLAUDE.local.md
+samples/
